@@ -1,5 +1,7 @@
 //! Contains the Error enum for things to do with an implementor of [`super::ProvableOp`].
 
+use crate::commit::PCSError;
+
 #[derive(thiserror::Error, Debug)]
 pub enum ProvableOpError {
     /// Error returned when the parameters to a function are incorrect, for instance
@@ -21,10 +23,19 @@ pub enum ProvableOpError {
     /// Error returned when there is a problem with parsing the ONNX model
     #[error("Error parsing ONNX model: {0}")]
     OnnxParsingError(String),
+    /// Error returned when there is a priblem related to Polynomial Commitments
+    #[error("Commitment Error: {0}")]
+    PCSError(PCSError),
 }
 
 impl From<anyhow::Error> for ProvableOpError {
     fn from(error: anyhow::Error) -> Self {
         ProvableOpError::GenericError(error)
+    }
+}
+
+impl From<PCSError> for ProvableOpError {
+    fn from(error: PCSError) -> Self {
+        ProvableOpError::PCSError(error)
     }
 }

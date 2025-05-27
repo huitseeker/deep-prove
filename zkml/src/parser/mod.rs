@@ -241,7 +241,8 @@ mod tests {
     use super::*;
 
     use crate::{
-        Context, Prover, ScalingFactor, init_test_logging, quantization::InferenceObserver, verify,
+        Context, Prover, ScalingFactor, commit::Pcs, init_test_logging,
+        quantization::InferenceObserver, verify,
     };
     use goldilocks::GoldilocksExt2;
     use tracing::info;
@@ -318,19 +319,19 @@ mod tests {
 
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
         info!("GENERATING CONTEXT...");
-        let ctx =
-            Context::<GoldilocksExt2>::generate(&model, None).expect("Unable to generate context");
+        let ctx = Context::<GoldilocksExt2, Pcs<GoldilocksExt2>>::generate(&model, None)
+            .expect("Unable to generate context");
         info!("GENERATING CONTEXT DONE...");
         let io = trace.to_verifier_io();
         info!("GENERATING Proof...");
-        let prover: Prover<'_, GoldilocksExt2, BasicTranscript<GoldilocksExt2>> =
+        let prover: Prover<'_, GoldilocksExt2, BasicTranscript<GoldilocksExt2>, _> =
             Prover::new(&ctx, &mut tr);
         let proof = prover.prove(trace).expect("unable to generate proof");
         info!("GENERATING Proof DONE...");
         let mut verifier_transcript: BasicTranscript<GoldilocksExt2> =
             BasicTranscript::new(b"m2vec");
 
-        verify::<_, _>(ctx, proof, io, &mut verifier_transcript).unwrap();
+        verify::<_, _, _>(ctx, proof, io, &mut verifier_transcript).unwrap();
     }
 
     #[test]
@@ -365,16 +366,16 @@ mod tests {
         println!("Result: {:?}", trace.outputs());
 
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
-        let ctx =
-            Context::<GoldilocksExt2>::generate(&model, None).expect("Unable to generate context");
+        let ctx = Context::<GoldilocksExt2, Pcs<GoldilocksExt2>>::generate(&model, None)
+            .expect("Unable to generate context");
 
-        let prover: Prover<'_, GoldilocksExt2, BasicTranscript<GoldilocksExt2>> =
+        let prover: Prover<'_, GoldilocksExt2, BasicTranscript<GoldilocksExt2>, _> =
             Prover::new(&ctx, &mut tr);
         let io = trace.to_verifier_io();
         let proof = prover.prove(trace).expect("unable to generate proof");
         let mut verifier_transcript: BasicTranscript<GoldilocksExt2> =
             BasicTranscript::new(b"m2vec");
-        verify::<_, _>(ctx, proof, io, &mut verifier_transcript).unwrap();
+        verify::<_, _, _>(ctx, proof, io, &mut verifier_transcript).unwrap();
     }
 
     #[test]

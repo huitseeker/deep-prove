@@ -2,6 +2,7 @@ mod error;
 
 use anyhow::{Result, anyhow, ensure};
 use ff_ext::ExtensionField;
+use mpcs::PolynomialCommitmentScheme;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -10,7 +11,7 @@ use std::{
 use transcript::Transcript;
 
 use crate::{
-    Claim, Element, Prover, ScalingFactor, ScalingStrategy, Tensor,
+    Claim, Context, Element, Prover, ScalingFactor, ScalingStrategy, Tensor,
     commit::precommit::PolyID,
     iop::{
         context::{ContextAux, ShapeStep},
@@ -22,7 +23,10 @@ use crate::{
     tensor::{ConvData, Number},
 };
 
-use super::{Layer, LayerCtx, LayerProof, flatten::Flatten, requant::Requant};
+use super::{
+    Layer, LayerCtx, LayerProof, convolution::ConvCtx, dense::DenseCtx, flatten::Flatten,
+    requant::Requant,
+};
 
 pub(crate) type NodeId = usize;
 
@@ -322,13 +326,14 @@ pub trait PadOp {
     }
 }
 
-pub trait ProvableOp<E>: OpInfo + PadOp
+pub trait ProvableOp<E, PCS>: OpInfo + PadOp
 where
     E: ExtensionField,
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E>,
 {
-    type Ctx: VerifiableCtx<E>;
+    type Ctx: VerifiableCtx<E, PCS>;
 
     /// Produces a proof of correct execution for this operation.
     fn prove<T: Transcript<E>>(
@@ -337,7 +342,7 @@ where
         _ctx: &Self::Ctx,
         _last_claims: Vec<&Claim<E>>,
         _step_data: &StepData<E, E>,
-        _prover: &mut Prover<E, T>,
+        _prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>, ProvableOpError> {
         // Default implementation, to avoid having to implement this method in case `is_provable` is false
         assert!(
@@ -351,7 +356,8 @@ where
     fn gen_lookup_witness(
         &self,
         _id: NodeId,
-        _gen: &mut LookupWitnessGen<E>,
+        _gen: &mut LookupWitnessGen<E, PCS>,
+        _ctx: &Context<E, PCS>,
         _step_data: &StepData<Element, E>,
     ) -> Result<(), ProvableOpError> {
         // Default implementation for nodes that don't employ a lookup table
@@ -359,11 +365,12 @@ where
     }
 }
 
-pub trait VerifiableCtx<E>: Debug
+pub trait VerifiableCtx<E, PCS>: Debug
 where
     E: ExtensionField,
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E>,
 {
     type Proof: Sized;
 
@@ -372,7 +379,7 @@ where
         &self,
         proof: &Self::Proof,
         last_claims: &[&Claim<E>],
-        verifier: &mut Verifier<E, T>,
+        verifier: &mut Verifier<E, T, PCS>,
         shape_step: &ShapeStep,
     ) -> Result<Vec<Claim<E>>, ProvableOpError>;
 
@@ -387,7 +394,11 @@ where
 
 // Helper method to call `VerifiableCtx::output_shapes` when the type `E`
 // cannot be inferred automatically by the compiler
-pub(crate) fn output_shapes<E: ExtensionField, C: VerifiableCtx<E>>(
+pub(crate) fn output_shapes<
+    E: ExtensionField,
+    PCS: PolynomialCommitmentScheme<E>,
+    C: VerifiableCtx<E, PCS>,
+>(
     ctx: &C,
     input_shapes: &[Vec<usize>],
     padding_mode: PaddingMode,
@@ -399,24 +410,30 @@ where
     ctx.output_shapes(input_shapes, padding_mode)
 }
 
-impl<E: ExtensionField> VerifiableCtx<E> for LayerCtx<E>
+impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS> for LayerCtx<E>
 where
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
 {
-    type Proof = LayerProof<E>;
+    type Proof = LayerProof<E, PCS>;
 
     fn verify<T: Transcript<E>>(
         &self,
-        proof: &LayerProof<E>,
+        proof: &LayerProof<E, PCS>,
         last_claims: &[&Claim<E>],
-        verifier: &mut Verifier<E, T>,
+        verifier: &mut Verifier<E, T, PCS>,
         shape_step: &ShapeStep,
     ) -> Result<Vec<Claim<E>>, ProvableOpError> {
         match self {
             LayerCtx::Dense(dense_ctx) => {
                 if let LayerProof::Dense(proof) = proof {
-                    dense_ctx.verify(proof, last_claims, verifier, shape_step)
+                    <DenseCtx<E> as VerifiableCtx<E, PCS>>::verify(
+                        dense_ctx,
+                        proof,
+                        last_claims,
+                        verifier,
+                        shape_step,
+                    )
                 } else {
                     Err(ProvableOpError::ParameterError(
                         "dense proof not found for dense layer".to_string(),
@@ -425,7 +442,13 @@ where
             }
             LayerCtx::Convolution(conv_ctx) => {
                 if let LayerProof::Convolution(proof) = proof {
-                    conv_ctx.verify(proof, last_claims, verifier, shape_step)
+                    <ConvCtx<E> as VerifiableCtx<E, PCS>>::verify(
+                        conv_ctx,
+                        proof,
+                        last_claims,
+                        verifier,
+                        shape_step,
+                    )
                 } else {
                     Err(ProvableOpError::ParameterError(
                         "conv proof not found for convolution layer".to_string(),
@@ -469,16 +492,26 @@ where
         padding_mode: PaddingMode,
     ) -> Vec<Vec<usize>> {
         match self {
-            LayerCtx::Dense(dense_ctx) => dense_ctx.output_shapes(input_shapes, padding_mode),
-            LayerCtx::Convolution(conv_ctx) => conv_ctx.output_shapes(input_shapes, padding_mode),
+            LayerCtx::Dense(dense_ctx) => <DenseCtx<E> as VerifiableCtx<E, PCS>>::output_shapes(
+                dense_ctx,
+                input_shapes,
+                padding_mode,
+            ),
+            LayerCtx::Convolution(conv_ctx) => {
+                <ConvCtx<E> as VerifiableCtx<E, PCS>>::output_shapes(
+                    conv_ctx,
+                    input_shapes,
+                    padding_mode,
+                )
+            }
             LayerCtx::Activation(activation_ctx) => {
-                output_shapes::<E, _>(activation_ctx, input_shapes, padding_mode)
+                output_shapes::<E, PCS, _>(activation_ctx, input_shapes, padding_mode)
             }
             LayerCtx::Requant(requant_ctx) => {
-                output_shapes::<E, _>(requant_ctx, input_shapes, padding_mode)
+                output_shapes::<E, PCS, _>(requant_ctx, input_shapes, padding_mode)
             }
             LayerCtx::Pooling(pooling_ctx) => {
-                output_shapes::<E, _>(pooling_ctx, input_shapes, padding_mode)
+                output_shapes::<E, PCS, _>(pooling_ctx, input_shapes, padding_mode)
             }
             LayerCtx::Flatten => {
                 <Flatten as OpInfo>::output_shapes(&Flatten, input_shapes, padding_mode)
